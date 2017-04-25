@@ -29,7 +29,7 @@ $OK $WARNING $CRITICAL $UNKNOWN $DOWN $UNREACHABLE
 $DETAIL_LIST $DETAIL_LIST_FULL $DETAIL_HTML $DETAIL_STDERR $DETAIL_PERFORMANCE
 $DETAIL_PERFORMANCE_CLASSIC $DETAIL_STATUS $DETAIL_PERFORMANCE_LINK $DETAIL_XML $DETAIL_NAGIOS2
 $DETAIL_NOTES_LINK $DETAIL_SERVICE_DEFINITION $DETAIL_SEND_NSCA $DETAIL_FEED_PASSIVE
-$DETAIL_ENCODE_COMMANDS $DETAIL_HIDEIFOK $DETAIL_SEND_GEARMAN
+$DETAIL_ENCODE_COMMANDS $DETAIL_HIDEIFOK $DETAIL_SEND_GEARMAN $DETAIL_SEND_NRDP
 *DEBUG0 *DEBUG1 *DEBUG2 *DEBUG3 *DEBUG4
 );
 BEGIN {
@@ -98,6 +98,7 @@ $DETAIL_FEED_PASSIVE=8192;
 $DETAIL_ENCODE_COMMANDS=16384;
 $DETAIL_HIDEIFOK=32768;
 $DETAIL_SEND_GEARMAN=65536;
+$DETAIL_SEND_NRDP=131072;
 #
 #--- vars
 $no=0;
@@ -251,6 +252,13 @@ my %opt=(
 		send_gearman_resultqueue => "",
 		#--- send_gearman_srv: worker server
 		send_gearman_srv => "localhost",
+		send_nrdp	=> "/usr/local/nrdp/send_nrdp.sh",
+		#--- send_nrdp_url: nsca server name
+		send_nrdp_url	=> "https://nagios/nrdp",
+		#--- send_nrdp_token: nsca server Token
+		send_nrdp_token	=> "a1b2c3e4f5g6h7i8j9k0",
+		#--- send_nrdp_opts: options to provide to send_nsca
+		send_nrdp_delim => ";",
 		#--- send_nsca: path to binary
 		send_nsca	=> "@sbindir@/send_nsca",
 		#--- send_nsca_cfg: path to config file
@@ -890,6 +898,8 @@ Extended options:
      8192: checkresults_file: all child checks are reported to Nagios via checkresults_file
     16384: print commands encoded (alternative to config files)
     32768: hide OK state child checks
+    65536: send_gearman: all child checks will be reported to Nagios via send_gearman
+   131072: send_nrdp: all child checks will be reported to Nagios via send_nrdp
 
 EXTENDED_EOF
 }
@@ -944,6 +954,10 @@ Set options:
    pnp_version=<0.6|0.4> - pnp_version needed for mouseover popups? default:$opt{set}{pnp_version}
    report=<number> - binary coded report option, default:$opt{set}{report}
    report_inherit_mask=<0|1> - report option will be inherited and masked, default:$opt{set}{report_inherit_mask}
+   send_nrdp=<path/to/send_nrdp> - path to send_nrdp binary, default:$opt{set}{send_nrdp}
+   send_nrdp_url=<NRDP server URL> - URL of NRDP server.  Usually http://<IP_ADDRESS>/nrdp/
+   send_nrdp_token=<TOKEN> - Shared token.  Must be the same token set in NRDP Server, default:$opt{set}{send_nrdp_token}
+   send_nrdp_delim=<string> - delimiter characters to separate NSCA fields, default:$opt{set}{send_nrdp_delim}
    send_nsca=<path/to/send_nsca> - path to send_nsca binary, default:$opt{set}{send_nsca}
    send_nsca_cfg=</path/to/send_nsca.cfg> -  path to send_nsca cfg file, default:$opt{set}{send_nsca_cfg}
    send_nsca_srv=<NSCA server> - server to send NSCA messages to, default:$opt{set}{send_nsca_srv}
@@ -4263,15 +4277,19 @@ sub report_all {
 	   !($opt{set}{report} & $DETAIL_HTML)) {
 		&report_xml;
 	}
+	#--- report to nrdp (send_nrdp wrapper)
+	if ($opt{set}{report} & $DETAIL_SEND_NRDP) {
+		&report_send_nrdp;
+	}
 	#--- report to nsca (send_nsca wrapper)
 	if ($opt{set}{report} & $DETAIL_SEND_NSCA) {
 		&report_send_nsca;
 	}
-	#--- report to nsca (send_nsca wrapper)
+	#--- report to nsca (send_gearman wrapper)
 	if ($opt{set}{report} & $DETAIL_SEND_GEARMAN) {
 		&report_send_gearman;
 	}
-	#--- report to nsca (send_nsca wrapper)
+	#--- report to passive feed (send_nsca wrapper)
 	if ($opt{set}{report} & $DETAIL_FEED_PASSIVE) {
 		&report_checkresult_file;
 	}
@@ -5274,6 +5292,79 @@ sub report_service_definition {
 		}
 	}
 	print $output;
+}
+
+#---
+#--- send check_multi results to NRDP daemon
+#---
+sub report_send_nrdp {
+#
+#   Send NRPD script for Nagios"
+#   Usage: send_nrdp.sh -u URL -t token [options]
+#   
+#	This script is used to send NRPD data to a Nagios server
+#
+#	Required:
+#    -u URL of NRDP server.  Usually http://<IP_ADDRESS>/nrdp/
+#    -t Shared token.  Must be the same token set in NRDP Server
+#
+#	Options:
+#    Single Check:
+#       -H    host name
+#       -s    service name
+#       -S    State
+#       -o     output
+#
+#    STDIN:
+#        [-d    delimiter] (default -d \"\\t\")"
+#        With only the required parameters $PROGNAME is capable of"
+#        processing data piped to it either from a file or other"
+#        process.  By default, we use \t as the delimiter however this"
+#        may be specified with the -d option data should be in the"
+#        following formats one entry per line."
+#        For Host checks:"
+#        hostname    State    output"
+#        For Service checks"
+#        hostname    servicename    State    output"
+	my $sent=0;
+	my @aggregated_msg;
+	
+	if (! -x "$opt{set}{send_nrdp}") {
+		add_error(0,"report_send_nrdp: $opt{set}{send_nrdp} not found or not executable:$!");
+		return $sent;
+	}
+
+	my $hostname=uc(get_hostname());
+	my $nrdp_cmdline="$opt{set}{send_nrdp} "."-u $opt{set}{send_nrdp_url} "."-t $opt{set}{send_nrdp_token} "."-d \'$opt{set}{send_nrdp_delim}\' "."> /dev/null 2>&1" ;
+	DEBUG3("cmdline is \'$nrdp_cmdline\'");
+		
+	for (my $i=1; $i<=$#cmds; $i++) {
+
+		#--- service will be suppressed if its mentioned in '-s suppress_service=<service1>,<service2>,...
+		if ($opt{set}{suppress_service} &&
+		    $opt{set}{suppress_service}=~/\b$cmds[$i]{name}\b/i) {
+			DEBUG2("checkresult file of [ $cmds[$i]{name} ] will be suppressed");
+			next;
+		}
+
+		my $full_nrdp_msg = $hostname.";".$cmds[$i]{name}.";".$cmds[$i]{rc}.";".$cmds[$i]{output};
+		DEBUG3("checkresult for send_nrdp is $full_nrdp_msg");
+		push @aggregated_msg, $full_nrdp_msg . "\n";
+
+		undef $full_nrdp_msg;
+	}
+
+	#--- call send_nrdp
+	open NRDP, "|-", $nrdp_cmdline;
+		print NRDP join ('', @aggregated_msg);
+		if ($?) {
+			add_error(0,"report_send_nrdp: error sending data to nrdp:$?");
+		} else {
+			$sent++;
+		}
+	close NRDP;
+
+	return $sent;
 }
 
 #---
